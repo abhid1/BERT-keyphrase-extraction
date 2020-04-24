@@ -1,0 +1,9 @@
+model/config.json
+model/pytorch_model.bin
+model/vocab.txt
+.idea/BERT-keyphrase-extraction.iml
+.idea/encodings.xml
+.idea/misc.xml
+.idea/modules.xml
+.idea/workspace.xml
+.idea/vcs.xml
