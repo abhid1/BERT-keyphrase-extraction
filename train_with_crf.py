@@ -217,53 +217,51 @@ if __name__ == '__main__':
     val_data = data_loader.load_data('val')
     ''' Shape
     {
-        data: [ [tensors] ],
-        tags: [ [tags] ]
+        data: [ [id-tensors] ],
+        tags: [ [tags-tensors] ]
     }
+    '''
+
+    '''Pytorch shape
+    [(sentence array, tag array)] 
     '''
 
     # Specify the training and validation dataset sizes
     params.train_size = train_data['size']
     params.val_size = val_data['size']
 
-    word_to_idx = {}
-    for sentence, tags in training_data:
-        for word in sentence:
-            if word not in word_to_ix:
-                word_to_ix[word] = len(word_to_ix)
-
     # Prepare model
     model = BERT_CRF(len(word_to_idx), tag_to_idx, embedding_dim, hidden_dim)
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
+    tag2idx = {'I': 0,
+               'O': 1}
     # Check predictions before training
     with torch.no_grad():
-        precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
-        precheck_tags = torch.tensor([tag_to_ix[t] for t in training_data[0][1]], dtype=torch.long)
+        precheck_sent = train_data['data'][0][0]
+        precheck_tags = train_data['tags'][0][0]
         print(model(precheck_sent))
 
     # Make sure prepare_sequence from earlier in the LSTM section is loaded
     for epoch in range(6):
-        for sentence, tags in train_data:
+        for i, sentence in enumerate(train_data['data']):
+            # Get each sentence example and its corresponding tags
+            tags = train_data['tags'][i]
+
             # Step 1. Remember that Pytorch accumulates gradients.
             # We need to clear them out before each instance
             model.zero_grad()
 
-            # Step 2. Get our inputs ready for the network, that is,
-            # turn them into Tensors of word indices.
-            sentence_in = prepare_sequence(sentence, word_to_ix)
-            targets = torch.tensor([tag_to_ix[t] for t in tags], dtype=torch.long)
+            # Step 2. Run our forward pass.
+            loss = model.neg_log_likelihood(sentence, tags)
 
-            # Step 3. Run our forward pass.
-            loss = model.neg_log_likelihood(sentence_in, targets)
-
-            # Step 4. Compute the loss, gradients, and update the parameters by
+            # Step 3. Compute the loss, gradients, and update the parameters by
             # calling optimizer.step()
             loss.backward()
             optimizer.step()
 
     # Check predictions after training
     with torch.no_grad():
-        precheck_sent = prepare_sequence(training_data[0][0], word_to_ix)
+        precheck_sent = train_data['data'][0][0]
         print(model(precheck_sent))
     # We got it!
