@@ -38,9 +38,8 @@ def argmax(vec):
     return idx.item()
 
 
-def prepare_sequence(seq, to_ix):
-    idxs = [to_ix[w] for w in seq]
-    return torch.tensor(idxs, dtype=torch.long)
+def log_sum_exp_batch(log_Tensor, axis=-1): # shape (batch_size,n,m)
+    return torch.max(log_Tensor, axis)[0]+torch.log(torch.exp(log_Tensor-torch.max(log_Tensor, axis)[0].view(log_Tensor.shape[0],-1,1)).sum(axis))
 
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
@@ -76,35 +75,23 @@ class BERT_CRF(nn.Module):
         self.transitions.data[:, tag_to_idx[STOP_TAG]] = -10000
 
     def _forward_alg(self, feats):
-        # Do the forward algorithm to compute the partition function
-        init_alphas = torch.full((1, self.tagset_size), -10000.)
-        # START_TAG has all of the score.
-        init_alphas[0][self.tag_to_idx[START_TAG]] = 0.
+        T = feats.shape[1]
+        batch_size = feats.shape[0]
 
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas
+        # alpha_recursion,forward, alpha(zt)=p(zt,bar_x_1:t)
+        log_alpha = torch.Tensor(batch_size, 1, self.tagset_size).fill_(-10000.).to(params.device)
+        # normal_alpha_0 : alpha[0]=Ot[0]*self.PIs
+        # START TAG has all of the score. it is log,0 is p=1
+        log_alpha[:, 0, self.tag_to_idx[START_TAG]] = 0
 
-        # Iterate through the sentence
-        for feat in feats:
-            alphas_t = []  # The forward tensors at this timestep
-            for next_tag in range(self.tagset_size):
-                # broadcast the emission score: it is the same regardless of
-                # the previous tag
-                emit_score = feat[next_tag].view(
-                    1, -1).expand(1, self.tagset_size)
-                # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
-                # The ith entry of next_tag_var is the value for the
-                # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score
-                # The forward variable for this tag is log-sum-exp of all the
-                # scores.
-                alphas_t.append(log_sum_exp(next_tag_var).view(1))
-            forward_var = torch.cat(alphas_t).view(1, -1)
-        terminal_var = forward_var + self.transitions[self.tag_to_idx[STOP_TAG]]
-        alpha = log_sum_exp(terminal_var)
-        return alpha
+        # feats: sentances -> word embedding -> lstm -> MLP -> feats
+        # feats is the probability of emission, feat.shape=(1,tag_size)
+        for t in range(1, T):
+            log_alpha = (log_sum_exp_batch(self.transitions + log_alpha, axis=-1) + feats[:, t]).unsqueeze(1)
+
+        # log_prob of all barX
+        log_prob_all_barX = log_sum_exp_batch(log_alpha)
+        return log_prob_all_barX
 
     def _get_bert_features(self, sentence, sentence_mask):
         '''
@@ -126,7 +113,7 @@ class BERT_CRF(nn.Module):
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
         score = torch.zeros(1)
-        tags = torch.cat([torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long), tags])
+        tags = torch.cat([torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long).cuda(), tags])
         for i, feat in enumerate(feats):
             score = score + \
                     self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
@@ -259,12 +246,13 @@ if __name__ == '__main__':
     model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
+    model.to(params.device)
+
     # Make sure prepare_sequence from earlier in the LSTM section is loaded
     for epoch in range(6):
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
 
         for batch_data, batch_tags in train_data_iterator:
-
 
             # Step 1. Remember that Pytorch accumulates gradients.
             # We need to clear them out before each instance
