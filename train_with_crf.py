@@ -6,6 +6,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from pytorch_pretrained_bert import BertModel
 
 from data_loader import DataLoader
 from evaluate import evaluate
@@ -52,24 +53,27 @@ def log_sum_exp(vec):
 
 class BERT_CRF(nn.Module):
 
-    def __init__(self, vocab_size, tag_to_idx, embedding_dim, hidden_dim):
+    def __init__(self, bert_model, vocab_size, tag_to_idx):
         super(BERT_CRF, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
+        self.hidden_size = 768
         self.vocab_size = vocab_size
-        self.tag_to_ix = tag_to_idx
+        self.tag_to_idx = tag_to_idx
         self.tagset_size = len(tag_to_idx)
 
-        self.word_embeds = nn.Embedding(vocab_size, embedding_dim)
+        self.bert = bert_model
+        self.dropout = torch.nn.Dropout(0.2)
 
-        # Maps the output of the LSTM into tag space.
-        self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
+        # Maps the output of BERT into tag space.
+        self.hidden2tag = nn.Linear(self.hidden_size, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
         self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
 
-        self.hidden = self.init_hidden()
+        # These two statements enforce the constraint that we never transfer
+        # to the start tag and we never transfer from the stop tag
+        self.transitions.data[tag_to_idx[START_TAG], :] = -10000
+        self.transitions.data[:, tag_to_idx[STOP_TAG]] = -10000
 
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
@@ -102,10 +106,19 @@ class BERT_CRF(nn.Module):
         alpha = log_sum_exp(terminal_var)
         return alpha
 
-    def _get_lstm_features(self, sentence):
+    def _get_bert_features(self, sentence, sentence_mask):
+        '''
+          sentances -> word embedding -> bert -> MLP -> feats
+          '''
+        bert_seq_out, _ = self.bert(sentence, token_type_ids=None, attention_mask=sentence_mask,
+                                    output_all_encoded_layers=False)
+        bert_seq_out = self.dropout(bert_seq_out)
+        bert_feats = self.hidden2label(bert_seq_out)
+        return bert_feats
+        # ===================================================== convert bottom to top
         self.hidden = self.init_hidden()
         embeds = self.word_embeds(sentence).view(len(sentence), 1, -1)
-        lstm_out, self.hidden = self.lstm(embeds, self.hidden)
+        lstm_out, self.hidden = self.bert(embeds, self.hidden)
         lstm_out = lstm_out.view(len(sentence), self.hidden_dim)
         lstm_feats = self.hidden2tag(lstm_out)
         return lstm_feats
@@ -164,19 +177,28 @@ class BERT_CRF(nn.Module):
         best_path.reverse()
         return path_score, best_path
 
-    def neg_log_likelihood(self, sentence, tags):
-        feats = self._get_lstm_features(sentence)
+    def neg_log_likelihood(self, sentence, tags, sentence_mask):
+        feats = self._get_bert_features(sentence, sentence_mask)
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
         return forward_score - gold_score
 
-    def forward(self, sentence):  # dont confuse this with _forward_alg above.
-        # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(sentence)
+    def forward(self, sentence, sentence_mask):  # dont confuse this with _forward_alg above.
+        # Get the emission scores from BERT
+        bert_feats = self._get_bert_features(sentence, sentence_mask)
 
         # Find the best path, given the features.
-        score, tag_seq = self._viterbi_decode(lstm_feats)
+        score, tag_seq = self._viterbi_decode(bert_feats)
         return score, tag_seq
+
+
+def add_start_stop_idx(tag2idx, idx2tag):
+    max_idx = max(list(tag2idx.values()))
+    tag2idx[START_TAG] = max_idx + 1
+    tag2idx[STOP_TAG] = max_idx + 2
+
+    idx2tag[max_idx + 1] = START_TAG
+    idx2tag[max_idx + 2] = STOP_TAG
 
 
 START_TAG = "<START>"
@@ -215,7 +237,7 @@ if __name__ == '__main__':
     # Load training data and test data
     train_data = data_loader.load_data('train')
     val_data = data_loader.load_data('val')
-    ''' Shape
+    '''Data Shape
     {
         data: [ [id-tensors] ],
         tags: [ [tags-tensors] ]
@@ -230,38 +252,29 @@ if __name__ == '__main__':
     params.train_size = train_data['size']
     params.val_size = val_data['size']
 
-    # Prepare model
-    model = BERT_CRF(len(word_to_idx), tag_to_idx, embedding_dim, hidden_dim)
-    optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
+    add_start_stop_idx(params.tag2idx, params.idx2tag)
 
-    tag2idx = {'I': 0,
-               'O': 1}
-    # Check predictions before training
-    with torch.no_grad():
-        precheck_sent = train_data['data'][0][0]
-        precheck_tags = train_data['tags'][0][0]
-        print(model(precheck_sent))
+    # Prepare model
+    bert_model = BertModel.from_pretrained(args.bert_model_dir)
+    model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
+    optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
     # Make sure prepare_sequence from earlier in the LSTM section is loaded
     for epoch in range(6):
-        for i, sentence in enumerate(train_data['data']):
-            # Get each sentence example and its corresponding tags
-            tags = train_data['tags'][i]
+        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+
+        for batch_data, batch_tags in train_data_iterator:
+
 
             # Step 1. Remember that Pytorch accumulates gradients.
             # We need to clear them out before each instance
             model.zero_grad()
 
             # Step 2. Run our forward pass.
-            loss = model.neg_log_likelihood(sentence, tags)
+            batch_masks = batch_data.gt(0)
+            loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks)
 
             # Step 3. Compute the loss, gradients, and update the parameters by
             # calling optimizer.step()
             loss.backward()
             optimizer.step()
-
-    # Check predictions after training
-    with torch.no_grad():
-        precheck_sent = train_data['data'][0][0]
-        print(model(precheck_sent))
-    # We got it!
