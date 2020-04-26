@@ -9,7 +9,6 @@ import torch.optim as optim
 from pytorch_pretrained_bert import BertModel
 
 from data_loader import DataLoader
-from evaluate import evaluate
 import utils
 import numpy as np
 
@@ -199,7 +198,7 @@ def f1_score(y_true, y_pred):
 
 
 
-def train(model, train_data, optimizer, params):
+def train(model, train_data, val_data, optimizer, params):
     print("***** Running Training *****")
     gradient_accumulation_steps = 1
     global_step_th = int(params.train_size / params.batch_size / gradient_accumulation_steps)
@@ -241,17 +240,19 @@ def train(model, train_data, optimizer, params):
                 global_step_th += 1
                 optimizer.step()
 
+        val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
+        evaluate(model, val_data_iterator, 'Validation Set')
 
 
-def evaluate(model, test_data_iterator):
-    print("***** Running prediction *****")
+
+def evaluate(model, data_iterator, dataset_name):
     model.eval()
     all_preds = []
     all_labels = []
     total = 0
     correct = 0
     with torch.no_grad():
-        for batch_data, batch_tags in test_data_iterator:
+        for batch_data, batch_tags in data_iterator:
             batch_masks = batch_data.gt(0)
             _, predicted_label_seq_ids = model(batch_data, batch_masks)
             valid_predicted = torch.masked_select(predicted_label_seq_ids, batch_masks)
@@ -263,6 +264,7 @@ def evaluate(model, test_data_iterator):
 
     test_acc = correct / total
     precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
+    print(dataset_name)
     print('Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f' \
           % (100. * test_acc, 100. * precision, 100. * recall, 100. * f1))
     print('--------------------------------------------------------------')
@@ -363,6 +365,7 @@ if __name__ == '__main__':
 
     model.to(params.device)
 
-    train(model, train_data, optimizer, params)
+    train(model, train_data, val_data, optimizer, params)
     test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
-    evaluate(model, test_data_iterator)
+    print("***** Running prediction *****")
+    evaluate(model, test_data_iterator, 'Test Set')
