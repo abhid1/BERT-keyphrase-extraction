@@ -11,6 +11,7 @@ from pytorch_pretrained_bert import BertModel
 from data_loader import DataLoader
 from evaluate import evaluate
 import utils
+import numpy as np
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', default='data/task1', help="Directory containing the dataset")
@@ -102,18 +103,13 @@ class BERT_CRF(nn.Module):
         bert_seq_out = self.dropout(bert_seq_out)
         bert_feats = self.hidden2tag(bert_seq_out)
         return bert_feats
-        # ===================================================== convert bottom to top
-        self.hidden = self.init_hidden()
-        embeds = self.word_embeds(sentence).view(len(sentence), 1, -1)
-        lstm_out, self.hidden = self.bert(embeds, self.hidden)
-        lstm_out = lstm_out.view(len(sentence), self.hidden_dim)
-        lstm_feats = self.hidden2tag(lstm_out)
-        return lstm_feats
+
 
     def _score_sentence(self, feats, tags):
         # Gives the score of a provided tag sequence
-        score = torch.zeros(1)
-        tags = torch.cat([torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long).cuda(), tags])
+        score = torch.zeros(1).cuda()
+        start = torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long).cuda()
+        tags = torch.cat([start, tags.flatten()])
         for i, feat in enumerate(feats):
             score = score + \
                     self.transitions[tags[i + 1], tags[i]] + feat[tags[i + 1]]
@@ -177,6 +173,177 @@ class BERT_CRF(nn.Module):
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(bert_feats)
         return score, tag_seq
+
+
+def f1_score(y_true, y_pred):
+    '''
+    0,1,2,3 are [CLS],[SEP],[X],O
+    '''
+    ignore_id = 3
+
+    num_proposed = len(y_pred[y_pred > ignore_id])
+    num_correct = (np.logical_and(y_true == y_pred, y_true > ignore_id)).sum()
+    num_gold = len(y_true[y_true > ignore_id])
+
+    try:
+        precision = num_correct / num_proposed
+    except ZeroDivisionError:
+        precision = 1.0
+
+    try:
+        recall = num_correct / num_gold
+    except ZeroDivisionError:
+        recall = 1.0
+
+    try:
+        f1 = 2 * precision * recall / (precision + recall)
+    except ZeroDivisionError:
+        if precision * recall == 0:
+            f1 = 1.0
+        else:
+            f1 = 0
+
+    return precision, recall, f1
+
+def train(model, train_data_iterator, optimizer, params, epoch):
+    model, train_data_iterator, optimizer, params
+    train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+    print("Epoch: ", epoch)
+    for batch_data, batch_tags in train_data_iterator:
+        # Step 1. Remember that Pytorch accumulates gradients.
+        # We need to clear them out before each instance
+        model.zero_grad()
+
+        # Step 2. Run our forward pass.
+        batch_masks = batch_data.gt(0)
+        loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks)
+
+        # Step 3. Compute the loss, gradients, and update the parameters by
+        # calling optimizer.step()
+        loss.sum().backward()
+        optimizer.step()
+
+
+def evaluate(model, predict_dataloader, batch_size, epoch_th, dataset_name):
+    # print("***** Running prediction *****")
+    model.eval()
+    all_preds = []
+    all_labels = []
+    total=0
+    correct=0
+    with torch.no_grad():
+        for batch in predict_dataloader:
+            batch = tuple(t.to(params.device) for t in batch)
+            input_ids, input_mask, segment_ids, predict_mask, label_ids = batch
+            out_scores = model(input_ids, segment_ids, input_mask)
+            # out_scores = out_scores.detach().cpu().numpy()
+            _, predicted = torch.max(out_scores, -1)
+            valid_predicted = torch.masked_select(predicted, predict_mask)
+            valid_label_ids = torch.masked_select(label_ids, predict_mask)
+            # print(len(valid_label_ids),len(valid_predicted),len(valid_label_ids)==len(valid_predicted))
+            all_preds.extend(valid_predicted.tolist())
+            all_labels.extend(valid_label_ids.tolist())
+            total += len(valid_label_ids)
+            correct += valid_predicted.eq(valid_label_ids).sum().item()
+
+    test_acc = correct/total
+    precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
+    print('Epoch:%d, Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f on %s' \
+        % (epoch_th, 100.*test_acc, 100.*precision, 100.*recall, 100.*f1, dataset_name)
+    print('--------------------------------------------------------------')
+    return test_acc, f1
+
+
+def f1_score(y_true, y_pred):
+    '''
+    0,1,2,3 are [CLS],[SEP],[X],O
+    '''
+    ignore_id = 3
+
+    num_proposed = len(y_pred[y_pred > ignore_id])
+    num_correct = (np.logical_and(y_true == y_pred, y_true > ignore_id)).sum()
+    num_gold = len(y_true[y_true > ignore_id])
+
+    try:
+        precision = num_correct / num_proposed
+    except ZeroDivisionError:
+        precision = 1.0
+
+    try:
+        recall = num_correct / num_gold
+    except ZeroDivisionError:
+        recall = 1.0
+
+    try:
+        f1 = 2 * precision * recall / (precision + recall)
+    except ZeroDivisionError:
+        if precision * recall == 0:
+            f1 = 1.0
+        else:
+            f1 = 0
+
+    return precision, recall, f1
+
+
+def train_and_evaluate(model, train_data, val_data, optimizer, params, model_dir, restore_file=None):
+    """Train the model and evaluate every epoch."""
+    # reload weights from restore_file if specified
+    if restore_file is not None:
+        restore_path = os.path.join(args.model_dir, args.restore_file + '.pth.tar')
+        logging.info("Restoring parameters from {}".format(restore_path))
+        utils.load_checkpoint(restore_path, model, optimizer)
+
+    best_val_f1 = 0.0
+    patience_counter = 0
+
+    for epoch in range(1, params.epoch_num + 1):
+        # Run one epoch
+        logging.info("Epoch {}/{}".format(epoch, params.epoch_num))
+
+        # Compute number of batches in one epoch
+        params.train_steps = params.train_size // params.batch_size
+        params.val_steps = params.val_size // params.batch_size
+
+        # data iterator for training
+        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+        # Train for one epoch on training set
+        train(model, train_data_iterator, optimizer, params, epoch)
+
+        # data iterator for evaluation
+        train_data_iterator = data_loader.data_iterator(train_data, shuffle=False)
+        val_data_iterator = data_loader.data_iterator(val_data, shuffle=False)
+
+        # Evaluate for one epoch on training set and validation set
+        params.eval_steps = params.train_steps
+        train_metrics = evaluate(model, train_data_iterator, params, mark='Train')
+        params.eval_steps = params.val_steps
+        val_metrics = evaluate(model, val_data_iterator, params, mark='Val')
+
+        val_f1 = val_metrics['f1']
+        improve_f1 = val_f1 - best_val_f1
+
+        # Save weights of the network
+        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+        optimizer_to_save = optimizer.optimizer if args.fp16 else optimizer
+        utils.save_checkpoint({'epoch': epoch + 1,
+                               'state_dict': model_to_save.state_dict(),
+                               'optim_dict': optimizer_to_save.state_dict()},
+                              is_best=improve_f1 > 0,
+                              checkpoint=model_dir)
+        if improve_f1 > 0:
+            logging.info("- Found new best F1")
+            best_val_f1 = val_f1
+            if improve_f1 < params.patience:
+                patience_counter += 1
+            else:
+                patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Early stopping and logging best f1
+        if (patience_counter >= params.patience_num and epoch > params.min_epoch_num) or epoch == params.epoch_num:
+            logging.info("Best val f1: {:05.2f}".format(best_val_f1))
+            break
 
 
 def add_start_stop_idx(tag2idx, idx2tag):
@@ -243,26 +410,10 @@ if __name__ == '__main__':
 
     # Prepare model
     bert_model = BertModel.from_pretrained(args.bert_model_dir)
+    bert_model.to(params.device)
     model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
     optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
 
     model.to(params.device)
 
-    # Make sure prepare_sequence from earlier in the LSTM section is loaded
-    for epoch in range(6):
-        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-
-        for batch_data, batch_tags in train_data_iterator:
-
-            # Step 1. Remember that Pytorch accumulates gradients.
-            # We need to clear them out before each instance
-            model.zero_grad()
-
-            # Step 2. Run our forward pass.
-            batch_masks = batch_data.gt(0)
-            loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks)
-
-            # Step 3. Compute the loss, gradients, and update the parameters by
-            # calling optimizer.step()
-            loss.backward()
-            optimizer.step()
+    train_and_evaluate(model, train_data, val_data, optimizer, params, args.model_dir, args.restore_file)
