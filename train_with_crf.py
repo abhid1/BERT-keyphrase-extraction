@@ -30,8 +30,14 @@ parser.add_argument('--loss_scale', type=float, default=0,
 
 '''
 Code borrowed from https://pytorch.org/tutorials/beginner/nlp/advanced_tutorial.html
-and adapted to BERT code from https://github.com/pranav-ust/BERT-keyphrase-extraction
+and mixed with https://github.com/Louis-udm/NER-BERT-CRF/blob/master/NER_BERT_CRF.py#L804
+then added to BERT code from https://github.com/pranav-ust/BERT-keyphrase-extraction
 '''
+
+def warmup_linear(x, warmup=0.002):
+    if x < warmup:
+        return x/warmup
+    return 1.0 - x
 
 def argmax(vec):
     # return the argmax as a python int
@@ -117,48 +123,34 @@ class BERT_CRF(nn.Module):
         return score
 
     def _viterbi_decode(self, feats):
-        backpointers = []
+        # T = self.max_seq_length
+        T = feats.shape[1]
+        batch_size = feats.shape[0]
 
-        # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.)
-        init_vvars[0][self.tag_to_idx[START_TAG]] = 0
+        log_delta = torch.Tensor(batch_size, 1, self.tagset_size).fill_(-10000.).to(params.device)
+        log_delta[:, 0, self.tag_to_idx[START_TAG]] = 0
 
-        # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = init_vvars
-        for feat in feats:
-            bptrs_t = []  # holds the backpointers for this step
-            viterbivars_t = []  # holds the viterbi variables for this step
+        # psi is for the vaule of the last latent that make P(this_latent) maximum.
+        psi = torch.zeros((batch_size, T, self.tagset_size), dtype=torch.long).to(params.device)  # psi[0]=0000 useless
+        for t in range(1, T):
+            # delta[t][k]=max_z1:t-1( p(x1,x2,...,xt,z1,z2,...,zt-1,zt=k|theta) )
+            # delta[t] is the max prob of the path from  z_t-1 to z_t[k]
+            log_delta, psi[:, t] = torch.max(self.transitions + log_delta, -1)
+            # psi[t][k]=argmax_z1:t-1( p(x1,x2,...,xt,z1,z2,...,zt-1,zt=k|theta) )
+            # psi[t][k] is the path choosed from z_t-1 to z_t[k],the value is the z_state(is k) index of z_t-1
+            log_delta = (log_delta + feats[:, t]).unsqueeze(1)
 
-            for next_tag in range(self.tagset_size):
-                # next_tag_var[i] holds the viterbi variable for tag i at the
-                # previous step, plus the score of transitioning
-                # from tag i to next_tag.
-                # We don't include the emission scores here because the max
-                # does not depend on them (we add them in below)
-                next_tag_var = forward_var + self.transitions[next_tag]
-                best_tag_id = argmax(next_tag_var)
-                bptrs_t.append(best_tag_id)
-                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
-            # Now add in the emission scores, and assign forward_var to the set
-            # of viterbi variables we just computed
-            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-            backpointers.append(bptrs_t)
+        # trace back
+        path = torch.zeros((batch_size, T), dtype=torch.long).to(params.device)
 
-        # Transition to STOP_TAG
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-        best_tag_id = argmax(terminal_var)
-        path_score = terminal_var[0][best_tag_id]
+        # max p(z1:t,all_x|theta)
+        max_logLL_allz_allx, path[:, -1] = torch.max(log_delta.squeeze(), -1)
 
-        # Follow the back pointers to decode the best path.
-        best_path = [best_tag_id]
-        for bptrs_t in reversed(backpointers):
-            best_tag_id = bptrs_t[best_tag_id]
-            best_path.append(best_tag_id)
-        # Pop off the start tag (we dont want to return that to the caller)
-        start = best_path.pop()
-        assert start == self.tag_to_idx[START_TAG]  # Sanity check
-        best_path.reverse()
-        return path_score, best_path
+        for t in range(T - 2, -1, -1):
+            # choose the state of z_t according the state choosed of z_t+1.
+            path[:, t] = psi[:, t + 1].gather(-1, path[:, t + 1].view(-1, 1)).squeeze()
+
+        return max_logLL_allz_allx, path
 
     def neg_log_likelihood(self, sentence, tags, sentence_mask):
         feats = self._get_bert_features(sentence, sentence_mask)
@@ -205,64 +197,87 @@ def f1_score(y_true, y_pred):
 
     return precision, recall, f1
 
-def train(model, train_data_iterator, optimizer, params, epoch):
-    model, train_data_iterator, optimizer, params
-    train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-    print("Epoch: ", epoch)
-    for batch_data, batch_tags in train_data_iterator:
-        # Step 1. Remember that Pytorch accumulates gradients.
-        # We need to clear them out before each instance
-        model.zero_grad()
-
-        # Step 2. Run our forward pass.
-        batch_masks = batch_data.gt(0)
-        loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks)
-
-        # Step 3. Compute the loss, gradients, and update the parameters by
-        # calling optimizer.step()
-        loss.sum().backward()
-        optimizer.step()
 
 
-def evaluate(model, predict_dataloader, batch_size, epoch_th, dataset_name):
-    # print("***** Running prediction *****")
+def train(model, train_data, optimizer, params):
+    print("***** Running Training *****")
+    gradient_accumulation_steps = 1
+    global_step_th = int(params.train_size / params.batch_size / gradient_accumulation_steps)
+    total_train_steps = int(params.train_size  / params.batch_size / gradient_accumulation_steps * params.epoch_num)
+    warmup_proportion = .1
+
+    for epoch in range(1, params.epoch_num + 1):
+        print("Epoch: ", epoch)
+        train_loss = 0
+        model.train()
+        optimizer.zero_grad()
+        gradient_accumulation_steps = 1
+
+        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+        step = 0
+        for batch_data, batch_tags in train_data_iterator:
+            # Step 1. Remember that Pytorch accumulates gradients.
+            # We need to clear them out before each instance
+            model.zero_grad()
+
+            # Step 2. Run our forward pass.
+            batch_masks = batch_data.gt(0)
+            loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks).sum()
+
+            if gradient_accumulation_steps > 1:
+                loss = loss / gradient_accumulation_steps
+            # Step 3. Compute the loss, gradients, and update the parameters by
+            # calling optimizer.step()
+            loss.backward()
+            train_loss += loss.item()
+
+            if (step + 1) % gradient_accumulation_steps == 0:
+                # modify learning rate with special warm up BERT uses
+                lr_this_step = params.learning_rate * warmup_linear(global_step_th / total_train_steps, warmup_proportion)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_this_step
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step_th += 1
+                optimizer.step()
+
+
+
+def evaluate(model, test_data_iterator):
+    print("***** Running prediction *****")
     model.eval()
     all_preds = []
     all_labels = []
-    total=0
-    correct=0
+    total = 0
+    correct = 0
     with torch.no_grad():
-        for batch in predict_dataloader:
-            batch = tuple(t.to(params.device) for t in batch)
-            input_ids, input_mask, segment_ids, predict_mask, label_ids = batch
-            out_scores = model(input_ids, segment_ids, input_mask)
-            # out_scores = out_scores.detach().cpu().numpy()
-            _, predicted = torch.max(out_scores, -1)
-            valid_predicted = torch.masked_select(predicted, predict_mask)
-            valid_label_ids = torch.masked_select(label_ids, predict_mask)
-            # print(len(valid_label_ids),len(valid_predicted),len(valid_label_ids)==len(valid_predicted))
+        for batch_data, batch_tags in test_data_iterator:
+            batch_masks = batch_data.gt(0)
+            _, predicted_label_seq_ids = model(batch_data, batch_masks)
+            valid_predicted = torch.masked_select(predicted_label_seq_ids, batch_masks)
+            valid_label_ids = torch.masked_select(batch_tags, batch_masks)
             all_preds.extend(valid_predicted.tolist())
             all_labels.extend(valid_label_ids.tolist())
             total += len(valid_label_ids)
             correct += valid_predicted.eq(valid_label_ids).sum().item()
 
-    test_acc = correct/total
+    test_acc = correct / total
     precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
-    print('Epoch:%d, Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f on %s' \
-        % (epoch_th, 100.*test_acc, 100.*precision, 100.*recall, 100.*f1, dataset_name)
+    print('Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f' \
+          % (100. * test_acc, 100. * precision, 100. * recall, 100. * f1))
     print('--------------------------------------------------------------')
     return test_acc, f1
 
 
 def f1_score(y_true, y_pred):
     '''
-    0,1,2,3 are [CLS],[SEP],[X],O
+    0,1,2,3 are I, O, START, STOP
     '''
-    ignore_id = 3
+    ignore_id = 2
 
-    num_proposed = len(y_pred[y_pred > ignore_id])
-    num_correct = (np.logical_and(y_true == y_pred, y_true > ignore_id)).sum()
-    num_gold = len(y_true[y_true > ignore_id])
+    num_proposed = len(y_pred[y_pred < ignore_id])
+    num_correct = (np.logical_and(y_true == y_pred, y_true < ignore_id)).sum()
+    num_gold = len(y_true[y_true < ignore_id])
 
     try:
         precision = num_correct / num_proposed
@@ -283,67 +298,6 @@ def f1_score(y_true, y_pred):
             f1 = 0
 
     return precision, recall, f1
-
-
-def train_and_evaluate(model, train_data, val_data, optimizer, params, model_dir, restore_file=None):
-    """Train the model and evaluate every epoch."""
-    # reload weights from restore_file if specified
-    if restore_file is not None:
-        restore_path = os.path.join(args.model_dir, args.restore_file + '.pth.tar')
-        logging.info("Restoring parameters from {}".format(restore_path))
-        utils.load_checkpoint(restore_path, model, optimizer)
-
-    best_val_f1 = 0.0
-    patience_counter = 0
-
-    for epoch in range(1, params.epoch_num + 1):
-        # Run one epoch
-        logging.info("Epoch {}/{}".format(epoch, params.epoch_num))
-
-        # Compute number of batches in one epoch
-        params.train_steps = params.train_size // params.batch_size
-        params.val_steps = params.val_size // params.batch_size
-
-        # data iterator for training
-        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-        # Train for one epoch on training set
-        train(model, train_data_iterator, optimizer, params, epoch)
-
-        # data iterator for evaluation
-        train_data_iterator = data_loader.data_iterator(train_data, shuffle=False)
-        val_data_iterator = data_loader.data_iterator(val_data, shuffle=False)
-
-        # Evaluate for one epoch on training set and validation set
-        params.eval_steps = params.train_steps
-        train_metrics = evaluate(model, train_data_iterator, params, mark='Train')
-        params.eval_steps = params.val_steps
-        val_metrics = evaluate(model, val_data_iterator, params, mark='Val')
-
-        val_f1 = val_metrics['f1']
-        improve_f1 = val_f1 - best_val_f1
-
-        # Save weights of the network
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        optimizer_to_save = optimizer.optimizer if args.fp16 else optimizer
-        utils.save_checkpoint({'epoch': epoch + 1,
-                               'state_dict': model_to_save.state_dict(),
-                               'optim_dict': optimizer_to_save.state_dict()},
-                              is_best=improve_f1 > 0,
-                              checkpoint=model_dir)
-        if improve_f1 > 0:
-            logging.info("- Found new best F1")
-            best_val_f1 = val_f1
-            if improve_f1 < params.patience:
-                patience_counter += 1
-            else:
-                patience_counter = 0
-        else:
-            patience_counter += 1
-
-        # Early stopping and logging best f1
-        if (patience_counter >= params.patience_num and epoch > params.min_epoch_num) or epoch == params.epoch_num:
-            logging.info("Best val f1: {:05.2f}".format(best_val_f1))
-            break
 
 
 def add_start_stop_idx(tag2idx, idx2tag):
@@ -391,21 +345,14 @@ if __name__ == '__main__':
     # Load training data and test data
     train_data = data_loader.load_data('train')
     val_data = data_loader.load_data('val')
-    '''Data Shape
-    {
-        data: [ [id-tensors] ],
-        tags: [ [tags-tensors] ]
-    }
-    '''
-
-    '''Pytorch shape
-    [(sentence array, tag array)] 
-    '''
+    test_data = data_loader.load_data('test')
 
     # Specify the training and validation dataset sizes
     params.train_size = train_data['size']
     params.val_size = val_data['size']
+    params.test_size = test_data['size']
 
+    # Add start and stop tag mappings
     add_start_stop_idx(params.tag2idx, params.idx2tag)
 
     # Prepare model
@@ -416,4 +363,6 @@ if __name__ == '__main__':
 
     model.to(params.device)
 
-    train_and_evaluate(model, train_data, val_data, optimizer, params, args.model_dir, args.restore_file)
+    train(model, train_data, optimizer, params)
+    test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
+    evaluate(model, test_data_iterator)
