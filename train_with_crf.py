@@ -5,7 +5,8 @@ import random
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import Adam
+from torch.optim.lr_scheduler import LambdaLR
 from pytorch_pretrained_bert import BertModel
 
 from data_loader import DataLoader
@@ -207,7 +208,6 @@ def train(model, train_data, val_data, optimizer, params):
 
     for epoch in range(1, params.epoch_num + 1):
         print("Epoch: ", epoch)
-        train_loss = 0
         model.train()
         optimizer.zero_grad()
         gradient_accumulation_steps = 1
@@ -217,7 +217,7 @@ def train(model, train_data, val_data, optimizer, params):
         for batch_data, batch_tags in train_data_iterator:
             # Step 1. Remember that Pytorch accumulates gradients.
             # We need to clear them out before each instance
-            model.zero_grad()
+            # model.zero_grad()
 
             # Step 2. Run our forward pass.
             batch_masks = batch_data.gt(0)
@@ -228,7 +228,6 @@ def train(model, train_data, val_data, optimizer, params):
             # Step 3. Compute the loss, gradients, and update the parameters by
             # calling optimizer.step()
             loss.backward()
-            train_loss += loss.item()
 
             if (step + 1) % gradient_accumulation_steps == 0:
                 # modify learning rate with special warm up BERT uses
@@ -238,7 +237,6 @@ def train(model, train_data, val_data, optimizer, params):
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step_th += 1
-                optimizer.step()
 
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
         evaluate(model, val_data_iterator, 'Validation Set')
@@ -360,12 +358,50 @@ if __name__ == '__main__':
     # Prepare model
     bert_model = BertModel.from_pretrained(args.bert_model_dir)
     bert_model.to(params.device)
-    model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
-    optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=1e-4)
+    crf_model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
+    # optimizer = optim.SGD(crf_model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
+    crf_model.to(params.device)
 
-    model.to(params.device)
+    if args.fp16:
+        crf_model.half()
 
-    train(model, train_data, val_data, optimizer, params)
+    if params.n_gpu > 1 and args.multi_gpu:
+        model = torch.nn.DataParallel(crf_model)
+
+    # Prepare optimizer
+    if params.full_finetuning:
+        param_optimizer = list(crf_model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        # no_decay = ['bias', 'gamma', 'beta']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+             'weight_decay_rate': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+             'weight_decay_rate': 0.0}
+        ]
+    else:
+        param_optimizer = list(crf_model.classifier.named_parameters())
+        optimizer_grouped_parameters = [{'params': [p for n, p in param_optimizer]}]
+    if args.fp16:
+        try:
+            from apex.optimizers import FP16_Optimizer
+            from apex.optimizers import FusedAdam
+        except ImportError:
+            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+        optimizer = FusedAdam(optimizer_grouped_parameters,
+                              lr=params.learning_rate,
+                              bias_correction=False,
+                              max_grad_norm=1.0)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 1/(1 + 0.05*epoch))
+        if args.loss_scale == 0:
+            optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+        else:
+            optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
+    else:
+        optimizer = Adam(optimizer_grouped_parameters, lr=params.learning_rate)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 1/(1 + 0.05*epoch))
+
+    train(crf_model, train_data, val_data, optimizer, params)
     test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
     print("***** Running prediction *****")
-    evaluate(model, test_data_iterator, 'Test Set')
+    evaluate(crf_model, test_data_iterator, 'Test Set')
