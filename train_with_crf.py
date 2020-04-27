@@ -167,39 +167,7 @@ class BERT_CRF(nn.Module):
         return score, tag_seq
 
 
-def f1_score(y_true, y_pred):
-    '''
-    0,1,2,3 are [CLS],[SEP],[X],O
-    '''
-    ignore_id = 3
-
-    num_proposed = len(y_pred[y_pred > ignore_id])
-    num_correct = (np.logical_and(y_true == y_pred, y_true > ignore_id)).sum()
-    num_gold = len(y_true[y_true > ignore_id])
-
-    try:
-        precision = num_correct / num_proposed
-    except ZeroDivisionError:
-        precision = 1.0
-
-    try:
-        recall = num_correct / num_gold
-    except ZeroDivisionError:
-        recall = 1.0
-
-    try:
-        f1 = 2 * precision * recall / (precision + recall)
-    except ZeroDivisionError:
-        if precision * recall == 0:
-            f1 = 1.0
-        else:
-            f1 = 0
-
-    return precision, recall, f1
-
-
-
-def train(model, train_data, val_data, optimizer, params):
+def train(model, train_data, val_data, optimizer, scheduler, params):
     print("***** Running Training *****")
     gradient_accumulation_steps = 1
     global_step_th = int(params.train_size / params.batch_size / gradient_accumulation_steps)
@@ -209,23 +177,22 @@ def train(model, train_data, val_data, optimizer, params):
     for epoch in range(1, params.epoch_num + 1):
         print("Epoch: ", epoch)
         model.train()
+        scheduler.step()
         optimizer.zero_grad()
         gradient_accumulation_steps = 1
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
         step = 0
         for batch_data, batch_tags in train_data_iterator:
-            # Step 1. Remember that Pytorch accumulates gradients.
-            # We need to clear them out before each instance
-            # model.zero_grad()
 
-            # Step 2. Run our forward pass.
+            #Run our forward pass.
             batch_masks = batch_data.gt(0)
             loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks).sum()
 
             if gradient_accumulation_steps > 1:
                 loss = loss / gradient_accumulation_steps
-            # Step 3. Compute the loss, gradients, and update the parameters by
+
+            # Compute the loss, gradients, and update the parameters by
             # calling optimizer.step()
             loss.backward()
 
@@ -268,10 +235,9 @@ def evaluate(model, data_iterator, dataset_name):
     print('--------------------------------------------------------------')
     return test_acc, f1
 
-
 def f1_score(y_true, y_pred):
     '''
-    0,1,2,3 are I, O, START, STOP
+    0,1,2,3 are I, O, [CLS], [SEP]
     '''
     ignore_id = 2
 
@@ -309,8 +275,8 @@ def add_start_stop_idx(tag2idx, idx2tag):
     idx2tag[max_idx + 2] = STOP_TAG
 
 
-START_TAG = "<START>"
-STOP_TAG = "<STOP>"
+START_TAG = "[CLS]"
+STOP_TAG = "[SEP]"
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -359,14 +325,13 @@ if __name__ == '__main__':
     bert_model = BertModel.from_pretrained(args.bert_model_dir)
     bert_model.to(params.device)
     crf_model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
-    # optimizer = optim.SGD(crf_model.parameters(), lr=params.learning_rate, weight_decay=params.weight_decay)
     crf_model.to(params.device)
 
     if args.fp16:
         crf_model.half()
 
     if params.n_gpu > 1 and args.multi_gpu:
-        model = torch.nn.DataParallel(crf_model)
+        crf_model = torch.nn.DataParallel(crf_model)
 
     # Prepare optimizer
     if params.full_finetuning:
@@ -401,7 +366,7 @@ if __name__ == '__main__':
         optimizer = Adam(optimizer_grouped_parameters, lr=params.learning_rate)
         scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 1/(1 + 0.05*epoch))
 
-    train(crf_model, train_data, val_data, optimizer, params)
+    train(crf_model, train_data, val_data, optimizer, scheduler, params)
     test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
     print("***** Running prediction *****")
     evaluate(crf_model, test_data_iterator, 'Test Set')
