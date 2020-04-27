@@ -203,10 +203,10 @@ def train(model, train_data, val_data, optimizer, scheduler, params):
         scheduler.step()
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-        evaluate(model, train_data_iterator, params, "Train Data")
+        evaluate(model, train_data_iterator, "Train Data")
         print()
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
-        evaluate(model, val_data_iterator, params, "Val Data")
+        evaluate(model, val_data_iterator, "Val Data")
         print('--------------------------------------------------------------')
     print()
 
