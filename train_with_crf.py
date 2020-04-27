@@ -203,9 +203,11 @@ def train(model, train_data, val_data, optimizer, scheduler, params):
         scheduler.step()
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+        params.eval_steps = params.train_steps
         evaluate(model, train_data_iterator, params, mark='Train')
         print()
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
+        params.eval_steps = params.val_steps
         evaluate(model, val_data_iterator, params, mark='Val')
         print('--------------------------------------------------------------')
     print()
@@ -329,6 +331,10 @@ if __name__ == '__main__':
     crf_model = BERT_CRF(bert_model, params.train_size, params.tag2idx)
     crf_model.to(params.device)
 
+    params.train_steps = params.train_size // params.batch_size
+    params.val_steps = params.val_size // params.batch_size
+    params.test_steps = params.test_size // params.batch_size
+
     if args.fp16:
         crf_model.half()
 
@@ -371,4 +377,5 @@ if __name__ == '__main__':
     train(crf_model, train_data, val_data, optimizer, scheduler, params)
     test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
     print("***** Running prediction *****")
+    params.eval_steps = params.test_steps
     evaluate(crf_model, test_data_iterator, params, mark='Test')
