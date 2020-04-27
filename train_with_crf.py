@@ -11,7 +11,7 @@ from pytorch_pretrained_bert import BertModel
 
 from data_loader import DataLoader
 import utils
-import numpy as np
+from evaluate import evaluate
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', default='data/task1', help="Directory containing the dataset")
@@ -123,20 +123,6 @@ class BERT_CRF(nn.Module):
         score = score + self.transitions[self.tag_to_idx[STOP_TAG], tags[-1]]
         return score
 
-        T = feats.shape[1]
-        batch_size = feats.shape[0]
-
-        batch_transitions = self.transitions.expand(batch_size, self.num_labels, self.num_labels)
-        batch_transitions = batch_transitions.flatten(1)
-
-        score = torch.zeros((feats.shape[0], 1)).to(device)
-        # the 0th node is start_label->start_word,the probability of them=1. so t begin with 1.
-        for t in range(1, T):
-            score = score + \
-                    batch_transitions.gather(-1, (label_ids[:, t] * self.num_labels + label_ids[:, t - 1]).view(-1, 1)) \
-                    + feats[:, t].gather(-1, label_ids[:, t].view(-1, 1)).view(-1, 1)
-        return score
-
     def _viterbi_decode(self, feats):
         T = feats.shape[1]
         batch_size = feats.shape[0]
@@ -217,70 +203,69 @@ def train(model, train_data, val_data, optimizer, scheduler, params):
         scheduler.step()
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-        evaluate(model, train_data_iterator, 'Training Set')
+        evaluate(model, train_data_iterator, params, mark='Train')
         print()
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
-        evaluate(model, val_data_iterator, 'Validation Set')
-        print('Avg Train Loss: %.5f' % loss_avg())
+        evaluate(model, val_data_iterator, params, mark='Val')
         print('--------------------------------------------------------------')
     print()
 
 
 
-def evaluate(model, data_iterator, dataset_name):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    total = 0
-    correct = 0
-    with torch.no_grad():
-        for batch_data, batch_tags in data_iterator:
-            batch_masks = batch_data.gt(0)
-            _, predicted_label_seq_ids = model(batch_data, batch_masks)
-            valid_predicted = torch.masked_select(predicted_label_seq_ids, batch_masks)
-            valid_label_ids = torch.masked_select(batch_tags, batch_masks)
-            all_preds.extend(valid_predicted.tolist())
-            all_labels.extend(valid_label_ids.tolist())
-            total += len(valid_label_ids)
-            correct += valid_predicted.eq(valid_label_ids).sum().item()
-
-    test_acc = correct / total
-    precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
-    print(dataset_name)
-    print('Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f' \
-          % (100. * test_acc, 100. * precision, 100. * recall, 100. * f1))
-    return test_acc, f1
-
-
-def f1_score(y_true, y_pred):
-    '''
-    0,1,2,3 are I, O, [CLS], [SEP]
-    '''
-    ignore_id = len(params.tag2idx) - 3
-
-    num_proposed = len(y_pred[y_pred < ignore_id])
-    num_correct = (np.logical_and(y_true == y_pred, y_true < ignore_id)).sum()
-    num_gold = len(y_true[y_true < ignore_id])
-
-    try:
-        precision = num_correct / num_proposed
-    except ZeroDivisionError:
-        precision = 1.0
-
-    try:
-        recall = num_correct / num_gold
-    except ZeroDivisionError:
-        recall = 1.0
-
-    try:
-        f1 = 2 * precision * recall / (precision + recall)
-    except ZeroDivisionError:
-        if precision * recall == 0:
-            f1 = 1.0
-        else:
-            f1 = 0
-
-    return precision, recall, f1
+# def evaluate(model, data_iterator, dataset_name):
+#     model.eval()
+#     all_preds = []
+#     all_labels = []
+#     total = 0
+#     correct = 0
+#     with torch.no_grad():
+#         for batch_data, batch_tags in data_iterator:
+#             batch_masks = batch_data.gt(0)
+#             _, predicted_label_seq_ids = model(batch_data, batch_masks)
+#             valid_predicted = torch.masked_select(predicted_label_seq_ids, batch_masks)
+#             valid_label_ids = torch.masked_select(batch_tags, batch_masks)
+#             all_preds.extend(valid_predicted.tolist())
+#             all_labels.extend(valid_label_ids.tolist())
+#             total += len(valid_label_ids)
+#             correct += valid_predicted.eq(valid_label_ids).sum().item()
+#
+#     test_acc = correct / total
+#     precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
+#     print(dataset_name)
+#     print('Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f' \
+#           % (100. * test_acc, 100. * precision, 100. * recall, 100. * f1))
+#     return test_acc, f1
+#
+#
+# def f1_score(y_true, y_pred):
+#     '''
+#     0,1,2,3 are I, O, [CLS], [SEP]
+#     '''
+#     ignore_id = len(params.tag2idx) - 3
+#
+#     num_proposed = len(y_pred[y_pred < ignore_id])
+#     num_correct = (np.logical_and(y_true == y_pred, y_true < ignore_id)).sum()
+#     num_gold = len(y_true[y_true < ignore_id])
+#
+#     try:
+#         precision = num_correct / num_proposed
+#     except ZeroDivisionError:
+#         precision = 1.0
+#
+#     try:
+#         recall = num_correct / num_gold
+#     except ZeroDivisionError:
+#         recall = 1.0
+#
+#     try:
+#         f1 = 2 * precision * recall / (precision + recall)
+#     except ZeroDivisionError:
+#         if precision * recall == 0:
+#             f1 = 1.0
+#         else:
+#             f1 = 0
+#
+#     return precision, recall, f1
 
 
 def add_start_stop_idx(tag2idx, idx2tag):
@@ -386,4 +371,4 @@ if __name__ == '__main__':
     train(crf_model, train_data, val_data, optimizer, scheduler, params)
     test_data_iterator = data_loader.data_iterator(test_data, shuffle=True)
     print("***** Running prediction *****")
-    evaluate(crf_model, test_data_iterator, 'Test Set')
+    evaluate(crf_model, test_data_iterator, params, mark='Test')
