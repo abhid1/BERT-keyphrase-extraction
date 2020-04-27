@@ -204,11 +204,11 @@ def train(model, train_data, val_data, optimizer, scheduler, params):
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
         params.eval_steps = params.train_steps
-        evaluate(model, train_data_iterator, params, mark='Train')
+        evaluate(model, train_data_iterator, params, mark='Train', isCRF=True)
         print()
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
         params.eval_steps = params.val_steps
-        evaluate(model, val_data_iterator, params, mark='Val')
+        evaluate(model, val_data_iterator, params, mark='Val', isCRF=True)
         print('--------------------------------------------------------------')
     print()
 
