@@ -34,10 +34,6 @@ and mixed with https://github.com/Louis-udm/NER-BERT-CRF/blob/master/NER_BERT_CR
 then added to BERT code from https://github.com/pranav-ust/BERT-keyphrase-extraction
 '''
 
-def warmup_linear(x, warmup=0.002):
-    if x < warmup:
-        return x/warmup
-    return 1.0 - x
 
 def argmax(vec):
     # return the argmax as a python int
@@ -49,14 +45,6 @@ def log_sum_exp_batch(log_Tensor, axis=-1): # shape (batch_size,n,m)
     return torch.max(log_Tensor, axis)[0]+torch.log(torch.exp(log_Tensor-torch.max(log_Tensor, axis)[0].view(log_Tensor.shape[0],-1,1)).sum(axis))
 
 
-# Compute log sum exp in a numerically stable way for the forward algorithm
-def log_sum_exp(vec):
-    max_score = vec[0, argmax(vec)]
-    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
-
-
 class BERT_CRF(nn.Module):
 
     def __init__(self, bert_model, vocab_size, tag_to_idx):
@@ -64,29 +52,42 @@ class BERT_CRF(nn.Module):
         self.hidden_size = 768
         self.vocab_size = vocab_size
         self.tag_to_idx = tag_to_idx
-        self.tagset_size = len(tag_to_idx)
+        self.num_labels = len(tag_to_idx)
 
         self.bert = bert_model
         self.dropout = torch.nn.Dropout(0.2)
 
         # Maps the output of BERT into tag space.
-        self.hidden2tag = nn.Linear(self.hidden_size, self.tagset_size)
+        self.hidden2tag = nn.Linear(self.hidden_size, self.num_labels)
 
         # Matrix of transition parameters.  Entry i,j is the score of
         # transitioning *to* i *from* j.
-        self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
+        self.transitions = nn.Parameter(torch.randn(self.num_labels, self.num_labels))
 
         # These two statements enforce the constraint that we never transfer
         # to the start tag and we never transfer from the stop tag
         self.transitions.data[tag_to_idx[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_idx[STOP_TAG]] = -10000
 
+        nn.init.xavier_uniform_(self.hidden2tag.weight)
+        nn.init.constant_(self.hidden2tag.bias, 0.0)
+
+    def init_bert_weights(self, module):
+        """ Initialize the weights.
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
     def _forward_alg(self, feats):
         T = feats.shape[1]
         batch_size = feats.shape[0]
 
         # alpha_recursion,forward, alpha(zt)=p(zt,bar_x_1:t)
-        log_alpha = torch.Tensor(batch_size, 1, self.tagset_size).fill_(-10000.).to(params.device)
+        log_alpha = torch.Tensor(batch_size, 1, self.num_labels).fill_(-10000.).to(params.device)
         # normal_alpha_0 : alpha[0]=Ot[0]*self.PIs
         # START TAG has all of the score. it is log,0 is p=1
         log_alpha[:, 0, self.tag_to_idx[START_TAG]] = 0
@@ -122,16 +123,29 @@ class BERT_CRF(nn.Module):
         score = score + self.transitions[self.tag_to_idx[STOP_TAG], tags[-1]]
         return score
 
-    def _viterbi_decode(self, feats):
-        # T = self.max_seq_length
         T = feats.shape[1]
         batch_size = feats.shape[0]
 
-        log_delta = torch.Tensor(batch_size, 1, self.tagset_size).fill_(-10000.).to(params.device)
+        batch_transitions = self.transitions.expand(batch_size, self.num_labels, self.num_labels)
+        batch_transitions = batch_transitions.flatten(1)
+
+        score = torch.zeros((feats.shape[0], 1)).to(device)
+        # the 0th node is start_label->start_word,the probability of them=1. so t begin with 1.
+        for t in range(1, T):
+            score = score + \
+                    batch_transitions.gather(-1, (label_ids[:, t] * self.num_labels + label_ids[:, t - 1]).view(-1, 1)) \
+                    + feats[:, t].gather(-1, label_ids[:, t].view(-1, 1)).view(-1, 1)
+        return score
+
+    def _viterbi_decode(self, feats):
+        T = feats.shape[1]
+        batch_size = feats.shape[0]
+
+        log_delta = torch.Tensor(batch_size, 1, self.num_labels).fill_(-10000.).to(params.device)
         log_delta[:, 0, self.tag_to_idx[START_TAG]] = 0
 
         # psi is for the vaule of the last latent that make P(this_latent) maximum.
-        psi = torch.zeros((batch_size, T, self.tagset_size), dtype=torch.long).to(params.device)  # psi[0]=0000 useless
+        psi = torch.zeros((batch_size, T, self.num_labels), dtype=torch.long).to(params.device)  # psi[0]=0000 useless
         for t in range(1, T):
             # delta[t][k]=max_z1:t-1( p(x1,x2,...,xt,z1,z2,...,zt-1,zt=k|theta) )
             # delta[t] is the max prob of the path from  z_t-1 to z_t[k]
@@ -169,44 +183,47 @@ class BERT_CRF(nn.Module):
 
 def train(model, train_data, val_data, optimizer, scheduler, params):
     print("***** Running Training *****")
-    gradient_accumulation_steps = 1
-    global_step_th = int(params.train_size / params.batch_size / gradient_accumulation_steps)
-    total_train_steps = int(params.train_size  / params.batch_size / gradient_accumulation_steps * params.epoch_num)
-    warmup_proportion = .1
-
     for epoch in range(1, params.epoch_num + 1):
         print("Epoch: ", epoch)
         model.train()
-        scheduler.step()
         optimizer.zero_grad()
-        gradient_accumulation_steps = 1
+
+        # a running average object for loss
+        loss_avg = utils.RunningAverage()
 
         train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
-        step = 0
         for batch_data, batch_tags in train_data_iterator:
-
-            #Run our forward pass.
+            # Run our forward pass.
             batch_masks = batch_data.gt(0)
             loss = model.neg_log_likelihood(batch_data, batch_tags, batch_masks).sum()
 
-            if gradient_accumulation_steps > 1:
-                loss = loss / gradient_accumulation_steps
+            if params.n_gpu > 1 and args.multi_gpu:
+                loss = loss.mean()  # mean() to average on multi-gpu
+
+            model.zero_grad()
+            if args.fp16:
+                optimizer.backward(loss)
+            else:
+                loss.backward()
+
+            # gradient clipping
+            nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=params.clip_grad)
 
             # Compute the loss, gradients, and update the parameters by
             # calling optimizer.step()
-            loss.backward()
+            optimizer.step()
+            loss_avg.update(loss.item())
 
-            if (step + 1) % gradient_accumulation_steps == 0:
-                # modify learning rate with special warm up BERT uses
-                lr_this_step = params.learning_rate * warmup_linear(global_step_th / total_train_steps, warmup_proportion)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr_this_step
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step_th += 1
+        scheduler.step()
 
+        train_data_iterator = data_loader.data_iterator(train_data, shuffle=True)
+        evaluate(model, train_data_iterator, 'Training Set')
+        print()
         val_data_iterator = data_loader.data_iterator(val_data, shuffle=True)
         evaluate(model, val_data_iterator, 'Validation Set')
+        print('Avg Train Loss: %.5f' % loss_avg())
+        print('--------------------------------------------------------------')
+    print()
 
 
 
@@ -232,14 +249,14 @@ def evaluate(model, data_iterator, dataset_name):
     print(dataset_name)
     print('Acc:%.2f, Precision: %.2f, Recall: %.2f, F1: %.2f' \
           % (100. * test_acc, 100. * precision, 100. * recall, 100. * f1))
-    print('--------------------------------------------------------------')
     return test_acc, f1
+
 
 def f1_score(y_true, y_pred):
     '''
     0,1,2,3 are I, O, [CLS], [SEP]
     '''
-    ignore_id = 2
+    ignore_id = len(params.tag2idx) - 3
 
     num_proposed = len(y_pred[y_pred < ignore_id])
     num_correct = (np.logical_and(y_true == y_pred, y_true < ignore_id)).sum()
