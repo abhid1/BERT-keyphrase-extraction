@@ -26,7 +26,7 @@ parser.add_argument('--multi_gpu', default=False, action='store_true', help="Whe
 parser.add_argument('--fp16', default=False, action='store_true', help="Whether to use 16-bit float precision instead of 32-bit")
 
 
-def evaluate(model, data_iterator, params, mark='Eval', verbose=False, isCRF=False):
+def evaluate(model, data_iterator, params, mark='Eval', verbose=False):
     """Evaluate the model on `steps` batches."""
     # set model to evaluation mode
     model.eval()
@@ -44,10 +44,7 @@ def evaluate(model, data_iterator, params, mark='Eval', verbose=False, isCRF=Fal
         batch_data, batch_tags = next(data_iterator)
         batch_masks = batch_data.gt(0)
 
-        if isCRF:
-            loss = model.bert(batch_data, token_type_ids=None, attention_mask=batch_masks, labels=batch_tags)
-        else:
-            loss = model(batch_data, token_type_ids=None, attention_mask=batch_masks, labels=batch_tags)
+        loss = model(batch_data, token_type_ids=None, attention_mask=batch_masks, labels=batch_tags)
 
         if params.n_gpu > 1 and params.multi_gpu:
             loss = loss.mean()
