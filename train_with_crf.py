@@ -240,8 +240,10 @@ def evaluate(model, data_iterator, dataset_name):
 def f1_score(y_true, y_pred):
     '''
     0,1,2,3 are I, O, [CLS], [SEP]
+    or
+    0,1,2,3,4,5,6,7,8 are B-Task, I-Task, B-Material, I-Material, B-Process, I-Process, O, [CLS], [SEP]
     '''
-    ignore_id = len(params.tag2idx) - 3
+    ignore_id = len(params.tag2idx) - 1
 
     num_proposed = len(y_pred[y_pred < ignore_id])
     num_correct = (np.logical_and(y_true == y_pred, y_true < ignore_id)).sum()
